@@ -16,6 +16,8 @@
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/operations.py 入湖接收/质量检查/隔离交接等跨模块动作
+│   ├── app/row_identity.py      共享行身份判断与去重（各入口共用，输入集各自保留）
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
@@ -80,6 +82,27 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+### 行身份与入湖去重
+
+- 入湖批次接收与入湖链路质量检查共用 `app/row_identity.py` 的行身份判断：
+  同值但字段顺序不同的两行视为同一行，接收入口只接收一行。
+- 两处去重**不共享输入集**：接收入口按提交上来的行去重，质量检查入口按原始
+  批次行去重，各自记录入口原始数与重复数；重放时可分别复算，互不覆盖。
+- 批次记录保留原始行（含重复行），`entry_stats` / `entry_stats_history`
+  保存各入口的计数，`IngestBatchService.append_batch_rows` 可向同一原始批次追加行。
+
+### 隔离交接
+
+- 隔离记录以"批次 + 规则 + 行身份"唯一，重跑质量检查不会产生第二条记录；
+  每条记录保留初次隔离结论（`_quarantine_first_conclusion` / 阈值）与历次结论。
+- 交接状态区分 `待确认` / `已确认` / `已解除` / `已关闭`：已确认的高额记录不再交付，
+  未确认的记录仍需补交。
+- 旧批恢复时若超额线调整（如 100→200）：
+  - `disposition="reuse_previous"` 延续原处置，仍判违规的未确认记录继续隔离；
+  - `disposition="reapply_new_rule"` 按新规则重处置，新规则判通过的记录核回首次
+    隔离结论后放行，入湖确认（`confirm_ingest`）后关闭待交记录。
+- 换新批号提交同样输入时按新规则独立计算，不影响旧批的计数与隔离记录。
 
 领域：数据工程
 子方向：数仓与数据湖

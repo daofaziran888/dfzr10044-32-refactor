@@ -11,9 +11,16 @@ from app.seed import SEED_ROWS
 
 class Store:
     def __init__(self) -> None:
-        self._tables: dict[str, list[dict[str, Any]]] = {
-            name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
-        }
+        # 运行时重新载入示例数据时直接替换表内容，已持有的模块服务实例继续可用。
+        self._tables: dict[str, list[dict[str, Any]]] = {}
+        self.reload()
+
+    def reload(self) -> None:
+        """重新载入全部示例数据，接口与链路的共享状态随之一并复位。"""
+        self._tables.clear()
+        self._tables.update(
+            {name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()}
+        )
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)

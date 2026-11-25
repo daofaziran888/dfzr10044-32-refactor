@@ -16,13 +16,16 @@
 """
 from __future__ import annotations
 
-import hashlib
 import time
 import uuid
 from typing import Any
 
 from app.lake_store import lake_store, BatchRecord, LakeSnapshot, PartitionFile
 from app.pipeline.chain_core import ChainContext, StepFunc
+from app.row_identity import dedupe_rows
+from app.services.ingest_batch import IngestBatchService
+from app.services.quality_rule import QualityRuleService
+from app.services.quarantine_zone import QuarantineZoneService
 
 
 # ============================================================
@@ -85,10 +88,53 @@ def _step_partition_plan_adopt(ctx: ChainContext) -> ChainContext:
 # 链路2：入湖批次→质量规则→隔离区处置
 # ============================================================
 
+_QA_AMOUNT_RULE: dict[str, Any] = {
+    "规则编号": "QR-AMOUNT",
+    "所属湖表": "",  # 调用方按湖表补齐
+    "校验列": "amount",
+    "校验类型": "RANGE",
+    "阈值下限": 0,
+    "阈值上限": 10000,
+    "违规处置": "隔离",
+}
+
+def receive_batch(lake_table: str, rows: list[dict[str, Any]],
+                  source_system: str = "OLTP_DB",
+                  window_start: str = "2026-11-01T00:00:00",
+                  window_end: str = "2026-11-01T23:59:59",
+                  batch_id: str | None = None) -> dict[str, Any]:
+    """接收入湖批次：与 ``IngestBatchService.ingest_batch`` 同一实现。
+
+    ``rows`` 是接收入口的输入集；同值但字段顺序不同的行只接收一行。
+    原始行与去重后的接收行都留在批次记录里，供质量检查入口按自己的输入集复算。
+    """
+    batch_id = batch_id or f"batch-{lake_table}-{uuid.uuid4().hex[:6]}"
+    dedup = dedupe_rows(rows)
+    br = lake_store.store_batch(
+        batch_id, lake_table, source_system, list(rows),
+        window_start, window_end, accepted_rows=dedup["unique_rows"])
+    lake_store.record_entry_stats(
+        batch_id, "ingest_receive",
+        {
+            "input_rows": dedup["input_rows"],
+            "unique_rows": len(dedup["unique_rows"]),
+            "duplicates_removed": dedup["duplicates_removed"],
+        },
+        input_rows=list(rows))
+    lake_store.update_batch_status(batch_id, "ingesting")
+    return {
+        "batch_id": batch_id,
+        "lake_table": lake_table,
+        "row_count": len(dedup["unique_rows"]),
+        "duplicates_removed": dedup["duplicates_removed"],
+        "checksum": br.checksum,
+        "window": f"{window_start} ~ {window_end}",
+    }
+
+
 def _step_ingest_batch_receive(ctx: ChainContext) -> ChainContext:
     """入湖批次接收：模拟一批数据行入湖。"""
     lk = ctx.lake_table
-    batch_id = f"batch-{lk}-{uuid.uuid4().hex[:6]}"
     rows = [
         {"event_time": "2026-11-01", "user_id": "u1", "action": "login", "amount": "100.00", "partition_dt": "20261101"},
         {"event_time": "2026-11-01", "user_id": "u2", "action": "purchase", "amount": "250.00", "partition_dt": "20261101"},
@@ -97,15 +143,21 @@ def _step_ingest_batch_receive(ctx: ChainContext) -> ChainContext:
         {"event_time": "", "user_id": "", "action": "", "amount": "", "partition_dt": "20261101"},  # 空行
         {"event_time": "2026-11-01", "user_id": "u4", "action": "transfer", "amount": "500.00", "partition_dt": "20261101"},
     ]
-    lake_store.store_batch(batch_id, lk, "OLTP_DB", rows, "2026-11-01T00:00:00", "2026-11-01T23:59:59")
+    received = receive_batch(lk, rows)
+    batch_id = received["batch_id"]
     ctx.output["batch_id"] = batch_id
-    ctx.output["row_count"] = len(rows)
+    ctx.output["row_count"] = received["row_count"]
     ctx.output["source_system"] = "OLTP_DB"
     return ctx
 
 
 def _step_quality_rule_check(ctx: ChainContext) -> ChainContext:
-    """质量规则校验：对批次做去重、非空校验、金额阈值判定。"""
+    """质量规则校验：对批次做去重、非空校验、金额阈值判定。
+
+    去重复用共享行身份判断，但输入集是本入口拿到的整批原始行，
+    因此 ``total_input`` / ``after_dedup`` / ``duplicates_removed``
+    仍然反映质量检查入口自己的计数，与接收入口互不覆盖。
+    """
     batch_id = ctx.output.get("batch_id")
     br = lake_store.get_batch(batch_id)
     if br is None:
@@ -113,18 +165,11 @@ def _step_quality_rule_check(ctx: ChainContext) -> ChainContext:
         ctx.output["quality_error"] = "batch not found"
         return ctx
 
-    rows = br.rows
-    # 去重
-    seen = set()
-    deduped: list[dict[str, Any]] = []
-    duplicates = 0
-    for r in rows:
-        key = hashlib.md5(str(sorted(r.items())).encode()).hexdigest()
-        if key in seen:
-            duplicates += 1
-        else:
-            seen.add(key)
-            deduped.append(r)
+    rows = list(br.rows)
+    # 去重：同值但字段顺序不同的行算同一行
+    dedup = dedupe_rows(rows)
+    deduped: list[dict[str, Any]] = dedup["unique_rows"]
+    duplicates = dedup["duplicates_removed"]
 
     # 非空校验：event_time/user_id/action 不为空
     valid: list[dict[str, Any]] = []
@@ -148,7 +193,7 @@ def _step_quality_rule_check(ctx: ChainContext) -> ChainContext:
         except (ValueError, TypeError):
             beyond_threshold.append(r)
 
-    ctx.output["quality"] = {
+    quality = {
         "total_input": len(rows),
         "after_dedup": len(deduped),
         "duplicates_removed": duplicates,
@@ -156,17 +201,50 @@ def _step_quality_rule_check(ctx: ChainContext) -> ChainContext:
         "beyond_threshold_removed": len(beyond_threshold),
         "clean_rows": len(within_threshold),
     }
+    ctx.output["quality"] = quality
     ctx.output["clean_data"] = within_threshold
     ctx.output["quarantine_data"] = empty_rows + beyond_threshold
+
+    br.clean_rows = list(within_threshold)
+    br.violation_rows = list(empty_rows) + list(beyond_threshold)
+    br.quality_result = {
+        "batch_id": batch_id,
+        "total_rows": len(rows),
+        "after_dedup": len(deduped),
+        "duplicates_removed": duplicates,
+        "clean_rows": len(within_threshold),
+        "violation_rows": len(empty_rows) + len(beyond_threshold),
+        "clean_data": list(within_threshold),
+        "violation_data": list(empty_rows) + list(beyond_threshold),
+        "rules_applied": [dict(_QA_AMOUNT_RULE, 所属湖表=br.lake_table)],
+    }
+    lake_store.record_entry_stats(
+        batch_id, "quality_check",
+        {
+            "input_rows": len(rows),
+            "unique_rows": len(deduped),
+            "duplicates_removed": duplicates,
+            "clean_rows": len(within_threshold),
+            "violation_rows": len(empty_rows) + len(beyond_threshold),
+        },
+        input_rows=list(rows))
+    if not br.rule_snapshot:
+        br.rule_snapshot = {str(_QA_AMOUNT_RULE["规则编号"]): dict(_QA_AMOUNT_RULE)}
+    br.rule_history.append({"at": time.time(), "rules": [dict(_QA_AMOUNT_RULE)]})
     return ctx
 
 
 def _step_quarantine_dispose(ctx: ChainContext) -> ChainContext:
-    """隔离区处置：违规行进入隔离区，标记为待处置。"""
+    """隔离区处置：违规行进入隔离区，标记为待处置。
+
+    交接按共享行身份幂等：同一条违规行重复执行不会产生第二条隔离记录。
+    """
     batch_id = ctx.output.get("batch_id")
     quarantine_data = ctx.output.get("quarantine_data", [])
     if quarantine_data:
-        lake_store.quarantine_rows(batch_id, "QR-AMOUNT", "金额阈值超额", quarantine_data)
+        QuarantineZoneService().isolate_violations(
+            batch_id, "QR-AMOUNT", "金额阈值超额", quarantine_data,
+            rule=_QA_AMOUNT_RULE)
     ctx.output["quarantine_count"] = len(quarantine_data)
     ctx.output["disposal"] = "isolated"
     return ctx
@@ -184,16 +262,38 @@ def _step_watermark_setup(ctx: ChainContext) -> ChainContext:
     return ctx
 
 
+def write_clean_batch(lake_table: str, clean_data: list[dict[str, Any]],
+                      source_system: str = "DIRECT",
+                      window_start: str = "2026-11-01T00:00:00",
+                      window_end: str = "2026-11-01T23:59:59") -> dict[str, Any]:
+    """把质量检查通过的正常行写入一个新批次（落湖写入）。
+
+    去重仍走共享行身份：正常行在质量检查时已按行身份去重，这里再幂等一次，
+    重放同一批通过行不会写出重复数据。
+    """
+    dedup = dedupe_rows(clean_data)
+    unique = dedup["unique_rows"]
+    batch_id = f"batch-ingest-{lake_table}-{uuid.uuid4().hex[:6]}"
+    lake_store.store_batch(batch_id, lake_table, source_system, list(unique),
+                           window_start, window_end)
+    lake_store.update_batch_status(batch_id, "ingesting")
+    br = lake_store.get_batch(batch_id)
+    if br is not None:
+        br.entry_stats["batch_write"] = {
+            "input_rows": dedup["input_rows"],
+            "unique_rows": len(unique),
+            "duplicates_removed": dedup["duplicates_removed"],
+        }
+    return {"batch_id": batch_id, "row_count": len(unique)}
+
+
 def _step_batch_ingest(ctx: ChainContext) -> ChainContext:
     """批次数据入湖写入（去重后有效行）。"""
     lk = ctx.lake_table
     clean_data = ctx.output.get("clean_data", [])
-    batch_id = f"batch-ingest-{lk}-{uuid.uuid4().hex[:6]}"
-    lake_store.store_batch(batch_id, lk, "DIRECT", clean_data,
-                           "2026-11-01T00:00:00", "2026-11-01T23:59:59")
-    lake_store.update_batch_status(batch_id, "ingesting")
-    ctx.output["ingest_batch_id"] = batch_id
-    ctx.output["ingest_rows"] = len(clean_data)
+    written = write_clean_batch(lk, clean_data)
+    ctx.output["ingest_batch_id"] = written["batch_id"]
+    ctx.output["ingest_rows"] = written["row_count"]
     return ctx
 
 
